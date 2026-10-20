@@ -6,8 +6,11 @@ Keys: WASD move | mouse aim | LMB fire | SPACE dash | R restart
 import math
 import random
 import sys
+from array import array
 
 import pygame
+
+SR = 44100
 
 W, H = 1280, 720
 DEADZONE = 0.2
@@ -16,6 +19,43 @@ AX_LX, AX_LY, AX_RX, AX_RY, AX_L2, AX_R2 = 0, 1, 2, 3, 4, 5
 BTN_L1, BTN_OPTIONS = 9, 6
 
 CYAN, PINK, YELLOW, GREEN, WHITE = (0, 255, 230), (255, 60, 140), (255, 220, 60), (80, 255, 120), (255, 255, 255)
+
+
+def synth(f0, f1, dur, vol=0.5, wave="square", decay=3.0):
+    """Procedural sound: pitch sweeps f0 -> f1 over dur seconds, exponential fade-out."""
+    n = int(SR * dur)
+    buf, phase = array("h"), 0.0
+    for i in range(n):
+        t = i / n
+        phase += (f0 + (f1 - f0) * t) / SR
+        if wave == "square":
+            s = 1.0 if phase % 1 < 0.5 else -1.0
+        elif wave == "sine":
+            s = math.sin(phase * math.tau)
+        else:
+            s = random.uniform(-1, 1)
+        buf.append(int(s * vol * math.exp(-decay * t) * 32767))
+    return pygame.mixer.Sound(buffer=buf.tobytes())
+
+
+def make_music():
+    """Short synthwave loop: Am - F - C - G, bass + arpeggio."""
+    step = 0.1875
+    chords = [(55.0, [220, 262, 330, 262]), (43.65, [175, 220, 262, 220]),
+              (65.41, [262, 330, 392, 330]), (49.0, [196, 247, 294, 247])]
+    buf = array("h")
+    for bass, arp in chords:
+        for st in range(4):
+            for k in range(2):  # two 8th-notes per step
+                f = arp[st] * (2 if k else 1)
+                n = int(SR * step / 2)
+                for i in range(n):
+                    t = i / n
+                    env = math.exp(-4 * t)
+                    a = (1.0 if (i * f / SR) % 1 < 0.5 else -1.0) * 0.12 * env
+                    b = math.sin(i * bass / SR * math.tau) * 0.35 * (1 if st % 2 == 0 else 0.6)
+                    buf.append(int((a + b) * 32767))
+    return pygame.mixer.Sound(buffer=buf.tobytes())
 
 
 def stick(joy, ax, ay):
@@ -66,7 +106,25 @@ class Enemy:
 
 class Game:
     def __init__(self):
+        pygame.mixer.pre_init(SR, -16, 1, 512)
         pygame.init()
+        try:
+            self.sfx = {
+                "shoot": synth(900, 300, 0.07, 0.15, "square", 5),
+                "kill": synth(300, 40, 0.25, 0.5, "noise", 5),
+                "boss": synth(120, 20, 0.8, 0.7, "noise", 3),
+                "hurt": synth(220, 50, 0.4, 0.6, "square", 4),
+                "dash": synth(200, 1200, 0.18, 0.3, "sine", 3),
+                "wave": synth(400, 800, 0.35, 0.3, "sine", 2),
+                "over": synth(400, 60, 1.2, 0.5, "square", 2),
+                "start": synth(300, 1500, 0.4, 0.4, "square", 3),
+            }
+            self.music = make_music()
+            self.music.set_volume(0.5)
+        except pygame.error:  # no audio device: play silently
+            self.sfx, self.music = {}, None
+        self.state = "title"
+        self.tick = 0.0
         self.screen = pygame.display.set_mode((W, H))
         pygame.display.set_caption("Twin Stick Drift")
         self.clock = pygame.time.Clock()
@@ -76,6 +134,22 @@ class Game:
         self.joy = None
         self.connect()
         self.reset()
+
+    def play(self, name):
+        if name in self.sfx:
+            self.sfx[name].play()
+
+    def begin(self):
+        self.reset()
+        self.state = "play"
+        self.play("start")
+        if self.music:
+            self.music.play(loops=-1)
+
+    def to_title(self):
+        self.state = "title"
+        if self.music:
+            self.music.fadeout(500)
 
     def connect(self):
         if pygame.joystick.get_count() and not self.joy:
@@ -95,6 +169,7 @@ class Game:
 
     def start_wave(self):
         self.wave += 1
+        self.play("wave")
         n = 4 + self.wave * 2
         self.to_spawn = ["chaser"] * n + ["shooter"] * (self.wave // 2)
         if self.wave % 5 == 0:
@@ -112,8 +187,12 @@ class Game:
         self.inv, self.shake, self.mult = 1.0, 14, 1
         self.burst(self.pos, CYAN, 30, 400)
         rumble(self.joy, 1.0, 1.0, 300)
+        self.play("hurt")
         if self.hp <= 0:
             self.dead = True
+            self.play("over")
+            if self.music:
+                self.music.fadeout(800)
             rumble(self.joy, 1.0, 1.0, 800)
 
     def read_input(self):
@@ -139,7 +218,7 @@ class Game:
         move, aim, fire, dash, restart = self.read_input()
         if self.dead:
             if restart:
-                self.reset()
+                self.begin()
             return
         if aim:
             self.aim = aim
@@ -151,6 +230,7 @@ class Game:
             self.vel = d * 900
             self.dash_t, self.dash_cd = 0.18, 1.2
             rumble(self.joy, 0.0, 0.6, 150)
+            self.play("dash")
         self.vel += move * 2200 * dt
         self.vel *= 0.985 if self.dash_t > 0 else 0.90 ** (dt * 60)
         self.pos += self.vel * dt
@@ -165,6 +245,7 @@ class Game:
             v = self.aim.rotate_rad(spread) * 900
             self.bullets.append([pygame.Vector2(self.pos), v + self.vel * 0.3, 1.2])
             rumble(self.joy, 0.0, 0.15, 40)
+            self.play("shoot")
 
         # waves
         if self.to_spawn:
@@ -216,6 +297,7 @@ class Game:
             self.mult, self.mult_t = min(10, self.mult + 1), 2.0
             self.shake = 8 if e.kind == "boss" else 3
             rumble(self.joy, 0.4, 0.2, 80)
+            self.play("boss" if e.kind == "boss" else "kill")
         self.mult_t -= dt
         if self.mult_t <= 0:
             self.mult = 1
@@ -262,8 +344,37 @@ class Game:
         if self.dead:
             t = self.big.render("GAME OVER", True, PINK)
             s.blit(t, t.get_rect(center=(W / 2, H / 2 - 30)))
-            t = self.font.render("press OPTIONS (or R) to restart", True, WHITE)
+            t = self.font.render("OPTIONS / R: restart     CIRCLE / T: title", True, WHITE)
             s.blit(t, t.get_rect(center=(W / 2, H / 2 + 30)))
+        pygame.display.flip()
+
+    def draw_title(self, dt):
+        self.tick += dt
+        s = self.screen
+        self.trail.fill((8, 6, 20, 60))
+        s.blit(self.trail, (0, 0))
+        if random.random() < 0.6:
+            self.parts.append(Particle((random.randint(0, W), H + 10), random.choice([CYAN, PINK, YELLOW]), 60, 3))
+            self.parts[-1].vel = pygame.Vector2(random.uniform(-20, 20), -random.uniform(60, 200))
+        for p in self.parts:
+            p.update(dt)
+            c = tuple(int(v * max(0, p.life) / p.max) for v in p.color)
+            pygame.draw.circle(s, c, p.pos, 3)
+        self.parts = [p for p in self.parts if p.life > 0]
+        bob = math.sin(self.tick * 2) * 8
+        for text, col, off in (("TWIN STICK", PINK, 4), ("TWIN STICK", CYAN, 0)):
+            t = self.big.render(text, True, col)
+            s.blit(t, t.get_rect(center=(W / 2 + off, H / 3 - 20 + bob + off)))
+        t = self.big.render("DRIFT", True, WHITE)
+        s.blit(t, t.get_rect(center=(W / 2, H / 3 + 50 + bob)))
+        if int(self.tick * 2) % 2 == 0:
+            msg = "press X to start" if self.joy else "press ENTER or click to start"
+            t = self.font.render(msg, True, YELLOW)
+            s.blit(t, t.get_rect(center=(W / 2, H * 0.62)))
+        lines = ["L stick  move    R stick  aim", "R2  fire    L1  dash", "Esc  quit"] if self.joy else                 ["WASD  move    mouse  aim + fire", "SPACE  dash    Esc  quit"]
+        for i, l in enumerate(lines):
+            t = self.font.render(l, True, (140, 140, 190))
+            s.blit(t, t.get_rect(center=(W / 2, H * 0.75 + i * 30)))
         pygame.display.flip()
 
     def run(self, max_frames=None):
@@ -273,12 +384,24 @@ class Game:
             for e in pygame.event.get():
                 if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
                     return
+                if self.state == "title" and (
+                        (e.type == pygame.JOYBUTTONDOWN and e.button in (0, BTN_OPTIONS))
+                        or (e.type == pygame.KEYDOWN and e.key in (pygame.K_RETURN, pygame.K_SPACE))
+                        or e.type == pygame.MOUSEBUTTONDOWN):
+                    self.begin()
+                elif self.state == "play" and self.dead and (
+                        (e.type == pygame.JOYBUTTONDOWN and e.button == 1)
+                        or (e.type == pygame.KEYDOWN and e.key == pygame.K_t)):
+                    self.to_title()
                 if e.type == pygame.JOYDEVICEADDED:
                     self.connect()
                 if e.type == pygame.JOYDEVICEREMOVED:
                     self.joy = None
-            self.update(dt)
-            self.draw()
+            if self.state == "title":
+                self.draw_title(dt)
+            else:
+                self.update(dt)
+                self.draw()
             frames += 1
             if max_frames and frames >= max_frames:
                 return
