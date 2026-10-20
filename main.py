@@ -19,6 +19,10 @@ AX_LX, AX_LY, AX_RX, AX_RY, AX_L2, AX_R2 = 0, 1, 2, 3, 4, 5
 BTN_L1, BTN_OPTIONS = 9, 6
 
 CYAN, PINK, YELLOW, GREEN, WHITE = (0, 255, 230), (255, 60, 140), (255, 220, 60), (80, 255, 120), (255, 255, 255)
+BTN_R1 = 10
+ORANGE, BLUE = (255, 140, 40), (90, 150, 255)
+# kind -> (letter, colour)
+PICKUPS = {"triple": ("3", GREEN), "shield": ("S", BLUE), "bomb": ("B", ORANGE), "heal": ("+", PINK)}
 
 
 def synth(f0, f1, dur, vol=0.5, wave="square", decay=3.0):
@@ -118,6 +122,8 @@ class Game:
                 "wave": synth(400, 800, 0.35, 0.3, "sine", 2),
                 "over": synth(400, 60, 1.2, 0.5, "square", 2),
                 "start": synth(300, 1500, 0.4, 0.4, "square", 3),
+                "pickup": synth(600, 1400, 0.15, 0.3, "sine", 2),
+                "bomb": synth(200, 20, 1.0, 0.8, "noise", 2.5),
             }
             self.music = make_music()
             self.music.set_volume(0.5)
@@ -163,6 +169,8 @@ class Game:
         self.hp, self.score, self.wave = 5, 0, 0
         self.mult, self.mult_t = 1, 0.0
         self.bullets, self.ebullets, self.enemies, self.parts = [], [], [], []
+        self.pickups = []  # [pos, kind, time_left]
+        self.triple_t, self.shield, self.bombs, self.bomb_held = 0.0, False, 0, True
         self.fire_cd = self.dash_cd = self.dash_t = self.inv = self.shake = 0.0
         self.to_spawn = []
         self.dead = False
@@ -180,8 +188,28 @@ class Game:
     def burst(self, pos, color, n=14, speed=240):
         self.parts += [Particle(pos, color, speed) for _ in range(n)]
 
+    def collect(self, kind):
+        self.play("pickup")
+        self.burst(self.pos, PICKUPS[kind][1], 18, 260)
+        rumble(self.joy, 0.0, 0.4, 100)
+        if kind == "triple":
+            self.triple_t = 10.0
+        elif kind == "shield":
+            self.shield = True
+        elif kind == "bomb":
+            self.bombs = min(3, self.bombs + 1)
+        else:
+            self.hp = min(5, self.hp + 1)
+
     def hurt(self):
         if self.inv > 0 or self.dash_t > 0:
+            return
+        if self.shield:
+            self.shield = False
+            self.inv = 0.8
+            self.burst(self.pos, BLUE, 24, 350)
+            rumble(self.joy, 0.5, 0.5, 150)
+            self.play("hurt")
             return
         self.hp -= 1
         self.inv, self.shake, self.mult = 1.0, 14, 1
@@ -224,7 +252,7 @@ class Game:
             self.aim = aim
 
         # movement with drift (inertia)
-        self.fire_cd -= dt; self.dash_cd -= dt; self.dash_t -= dt; self.inv -= dt; self.shake = max(0, self.shake - 40 * dt)
+        self.fire_cd -= dt; self.triple_t -= dt; self.dash_cd -= dt; self.dash_t -= dt; self.inv -= dt; self.shake = max(0, self.shake - 40 * dt)
         if dash and self.dash_cd <= 0:
             d = move.normalize() if move.length() > 0 else self.aim
             self.vel = d * 900
@@ -241,11 +269,33 @@ class Game:
         # shooting
         if fire and self.fire_cd <= 0:
             self.fire_cd = 0.11
-            spread = random.uniform(-0.04, 0.04)
-            v = self.aim.rotate_rad(spread) * 900
-            self.bullets.append([pygame.Vector2(self.pos), v + self.vel * 0.3, 1.2])
+            for off in ((-0.2, 0, 0.2) if self.triple_t > 0 else (0,)):
+                v = self.aim.rotate_rad(off + random.uniform(-0.04, 0.04)) * 900
+                self.bullets.append([pygame.Vector2(self.pos), v + self.vel * 0.3, 1.2])
             rumble(self.joy, 0.0, 0.15, 40)
             self.play("shoot")
+
+        # bomb: R1 / E (edge-triggered)
+        held = self.joy.get_button(BTN_R1) if self.joy else pygame.key.get_pressed()[pygame.K_e]
+        if held and not self.bomb_held and self.bombs > 0:
+            self.bombs -= 1
+            self.shake = 22
+            for e in self.enemies:
+                e.hp -= 10
+            self.ebullets.clear()
+            for _ in range(70):
+                self.parts.append(Particle(self.pos, ORANGE, 900, 0.8))
+            rumble(self.joy, 1.0, 1.0, 500)
+            self.play("bomb")
+        self.bomb_held = held
+
+        # pickups
+        for pk in self.pickups:
+            pk[2] -= dt
+            if pk[0].distance_to(self.pos) < 26:
+                pk[2] = 0
+                self.collect(pk[1])
+        self.pickups = [pk for pk in self.pickups if pk[2] > 0]
 
         # waves
         if self.to_spawn:
@@ -298,6 +348,11 @@ class Game:
             self.shake = 8 if e.kind == "boss" else 3
             rumble(self.joy, 0.4, 0.2, 80)
             self.play("boss" if e.kind == "boss" else "kill")
+            if e.kind == "boss" or random.random() < 0.10:
+                kind = random.choice(list(PICKUPS)) if e.kind != "boss" else random.choice(["bomb", "shield", "heal"])
+                if kind == "heal" and self.hp >= 5:
+                    kind = "triple"
+                self.pickups.append([pygame.Vector2(e.pos), kind, 9.0])
         self.mult_t -= dt
         if self.mult_t <= 0:
             self.mult = 1
@@ -326,6 +381,18 @@ class Game:
             if e.kind != "chaser":
                 pygame.draw.circle(s, e.color, (e.pos.x + ox, e.pos.y + oy), e.r * e.hp / e.max_hp)
 
+        for pos, kind, left in self.pickups:
+            letter, col = PICKUPS[kind]
+            if left < 3 and int(left * 8) % 2:
+                continue  # blink when about to vanish
+            r = 15 + math.sin(self.tick * 6) * 2
+            c = (pos.x + ox, pos.y + oy)
+            pygame.draw.polygon(s, col, [(c[0], c[1] - r), (c[0] + r, c[1]), (c[0], c[1] + r), (c[0] - r, c[1])], 2)
+            t = self.font.render(letter, True, col)
+            s.blit(t, t.get_rect(center=c))
+        if self.shield and not self.dead:
+            pygame.draw.circle(s, BLUE, (self.pos.x + ox, self.pos.y + oy), 26, 2)
+
         if not self.dead and (self.inv <= 0 or int(self.inv * 20) % 2):
             tip = self.pos + self.aim * 18
             l, r = self.pos + self.aim.rotate(140) * 14, self.pos + self.aim.rotate(-140) * 14
@@ -339,6 +406,11 @@ class Game:
         if self.dash_cd > 0:
             pygame.draw.rect(s, (60, 60, 90), (20, 52, 120, 6))
             pygame.draw.rect(s, CYAN, (20, 52, 120 * (1 - self.dash_cd / 1.2), 6))
+        for i in range(self.bombs):
+            pygame.draw.polygon(s, ORANGE, [(W - 30 - i * 28, 56), (W - 22 - i * 28, 64), (W - 30 - i * 28, 72), (W - 38 - i * 28, 64)], 2)
+        if self.triple_t > 0:
+            pygame.draw.rect(s, (30, 70, 40), (20, 64, 120, 6))
+            pygame.draw.rect(s, GREEN, (20, 64, 120 * self.triple_t / 10, 6))
         if not self.joy:
             s.blit(self.font.render("No controller - using keyboard/mouse", True, (140, 140, 170)), (20, H - 36))
         if self.dead:
@@ -371,7 +443,7 @@ class Game:
             msg = "press X to start" if self.joy else "press ENTER or click to start"
             t = self.font.render(msg, True, YELLOW)
             s.blit(t, t.get_rect(center=(W / 2, H * 0.62)))
-        lines = ["L stick  move    R stick  aim", "R2  fire    L1  dash", "Esc  quit"] if self.joy else                 ["WASD  move    mouse  aim + fire", "SPACE  dash    Esc  quit"]
+        lines = ["L stick  move    R stick  aim", "R2  fire    L1  dash    R1  bomb", "Esc  quit"] if self.joy else                 ["WASD  move    mouse  aim + fire", "SPACE  dash    E  bomb    Esc  quit"]
         for i, l in enumerate(lines):
             t = self.font.render(l, True, (140, 140, 190))
             s.blit(t, t.get_rect(center=(W / 2, H * 0.75 + i * 30)))
@@ -381,6 +453,7 @@ class Game:
         frames = 0
         while True:
             dt = min(self.clock.tick(60) / 1000, 0.05)
+            self.tick += dt if self.state == "play" else 0  # title advances its own clock
             for e in pygame.event.get():
                 if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
                     return
